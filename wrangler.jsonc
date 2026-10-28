@@ -3,6 +3,9 @@
   "name": "cloudflare-evolution-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-27",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "09f292848e1e48189d4a218123f071f7" }
+  ],
   "observability": { "enabled": true }
 }
