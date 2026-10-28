@@ -414,7 +414,9 @@ const resourceServer = new OAuthResourceServer<Env, OAuthProps>({
     resource: MCP_RESOURCE,
     authorization_servers: [MCP_ISSUER],
   },
-  requiredScopes: ["mcp:read", "mcp:write"],
+  // All connected clients need read access to use the MCP. Write access is
+  // checked separately by callEvolution for each non-GET operation.
+  requiredScopes: ["mcp:read"],
   validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
   handler: {
     fetch(request, env, ctx) {
