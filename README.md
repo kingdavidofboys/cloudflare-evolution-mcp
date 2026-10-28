@@ -32,21 +32,20 @@ No database table or row-level security policy change is needed. The Supabase se
 
 Deploy the entire folder as a Worker project. It uses Cloudflare's maintained Agents MCP handler. A single-file Quick Edit paste is not enough because the project depends on npm packages.
 
-1. Create a GitHub repository for this folder and connect it in Cloudflare Workers & Pages, or deploy the folder using Wrangler from a computer with Node.js installed.
-2. Create a Worker named `evolution-go-mcp` and deploy the project.
-3. In **Workers & Pages → evolution-go-mcp → Settings → Variables and Secrets**, add these as **Secret** values (not plain text variables):
+1. The existing Worker is `cloudflare-evolution-mcp`. Deploy this project from the connected GitHub repository or with Wrangler. The Wrangler config binds OAuth storage to the Cloudflare KV namespace `evolution-go-mcp-oauth`.
+2. In **Workers & Pages → cloudflare-evolution-mcp → Settings → Variables and Secrets**, add these as **Secret** values (not plain text variables):
 
    | Secret name | Value to use |
    | --- | --- |
-   | `MCP_ACCESS_TOKEN` | Make a new long random password. This protects the MCP endpoint. |
+   | `MCP_LOGIN_PASSWORD` | Create a new random password at least 32 characters long. ChatGPT will use it on the OAuth sign-in page. |
+   | `MCP_SESSION_SECRET` | A separate random secret at least 32 characters long. It signs the short-lived sign-in cookie. |
    | `EVOLUTION_INSTANCE_TOKEN` | The API token for the connected Evolution Go instance. Use the instance token, not the Supabase database URL/password. |
    | `EVOLUTION_GLOBAL_API_KEY` | The global Evolution Go API key already configured for the Render service. Needed for admin-only instance/license operations. |
    | `WHATSAPP_READ_URL` | The deployed Supabase function URL above. |
    | `WHATSAPP_READ_SECRET` | The same value you created in Supabase as `MCP_READ_SHARED_SECRET`. |
 
    If you do not need to read stored messages yet, leave both `WHATSAPP_READ_*` secrets unset; the other Evolution API tools still work.
-4. Deploy after adding the secrets. The MCP URL is `https://evolution-go-mcp.<your-cloudflare-subdomain>.workers.dev/mcp`. The MCP client must send `Authorization: Bearer <MCP_ACCESS_TOKEN>`. Do not put this token into a URL or paste it into chat.
-5. Add that URL to your ChatGPT custom MCP connection and choose the bearer/API-key authentication option if it offers one. If that connection only supports OAuth, this simple shared-token gate will need Cloudflare's OAuth wrapper before it can connect.
+3. The MCP URL is `https://cloudflare-evolution-mcp.mitchel1234special.workers.dev/mcp`. Add it to ChatGPT as a custom MCP server and choose OAuth. During setup, sign in with `MCP_LOGIN_PASSWORD` and approve the requested `mcp:read` and `mcp:write` scopes.
 
 ### Where to get the Evolution keys
 
@@ -60,7 +59,7 @@ Deploy the entire folder as a Worker project. It uses Cloudflare's maintained Ag
 - For any API operation other than GET, first get the user's clear approval of the specific change/message, then call with `confirm_write=true`.
 - Messages sent through Evolution Go can reach real people. Use only for the intended recipient and content the user requested. Avoid unsolicited bulk messaging, adding people to groups without their permission, and attempts to evade WhatsApp's limits; those can lead to account restrictions.
 - The current webhook stores incoming text messages after it is enabled. It ignores outgoing messages and non-message events. `whatsapp_saved_incoming_messages` therefore does not show outgoing messages, media contents, old history, or messages missed during downtime.
-- This draft is not deployed. Review it and add the secrets in the dashboards before connecting it to ChatGPT.
+- Replace any previously exposed API keys, delete their plain-text Worker Variables, and re-add the rotated values as **Secrets** before using the MCP.
 
 ## Source
 
