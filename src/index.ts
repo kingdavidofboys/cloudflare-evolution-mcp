@@ -1,5 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
+import { createMcpHandler, getMcpAuthContext } from "agents/mcp/server";
+import {
+  AuthorizationError,
+  OAuthAuthorizationServer,
+  OAuthResourceServer,
+  insufficientScope,
+  type ConsentDescription,
+} from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
 
 const EVOLUTION_BASE = "https://evolution-go-x7li.onrender.com";
@@ -9,11 +16,161 @@ const MAX_RESPONSE_CHARS = 24_000;
 const MAX_MESSAGE_LIMIT = 100;
 
 interface Env {
-  MCP_ACCESS_TOKEN: string;
+  MCP_LOGIN_PASSWORD: string;
+  MCP_SESSION_SECRET: string;
+  OAUTH_KV: KVNamespace;
   EVOLUTION_INSTANCE_TOKEN: string;
   EVOLUTION_GLOBAL_API_KEY?: string;
   WHATSAPP_READ_URL?: string;
   WHATSAPP_READ_SECRET?: string;
+}
+
+type OAuthEnv = Env;
+type OAuthProps = { userId: string; scopes: string[] };
+const OAUTH_SCOPES = ["mcp:read", "mcp:write", "offline_access"];
+const AUTH_COOKIE = "__Host-evolution-mcp-auth";
+const AUTH_SESSION_SECONDS = 600;
+const MCP_ISSUER = "https://cloudflare-evolution-mcp.mitchel1234special.workers.dev";
+const MCP_RESOURCE = `${MCP_ISSUER}/mcp`;
+
+const authorizationServer = new OAuthAuthorizationServer<OAuthEnv>({
+  issuer: MCP_ISSUER,
+  resources: [MCP_RESOURCE],
+  scopesSupported: OAUTH_SCOPES,
+  clientIdMetadataDocumentEnabled: true,
+  clientRegistrationEndpoint: "/oauth/register",
+});
+
+function htmlEscape(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
+}
+
+function safeHtml(body: string, headers = new Headers()): Response {
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set("Cache-Control", "no-store");
+  headers.set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("X-Content-Type-Options", "nosniff");
+  return new Response(body, { headers });
+}
+
+function loginPage(returnTo: string): Response {
+  const safeReturnTo = htmlEscape(returnTo);
+  return safeHtml(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Sign in to Evolution Go MCP</title><main><h1>Sign in</h1><p>Enter your MCP login password to continue.</p><form method="post" action="/login"><input type="hidden" name="return_to" value="${safeReturnTo}"><label>Password <input type="password" name="password" required autocomplete="current-password"></label><p><button type="submit">Continue</button></p></form></main></html>`);
+}
+
+function consentPage(details: ConsentDescription, handle: string): string {
+  const name = htmlEscape(details.clientName);
+  const origin = details.clientDomain
+    ? `Published by <strong>${htmlEscape(details.clientDomain)}</strong>.`
+    : "This client registered itself; its name is not verified.";
+  const scopes = details.scope.map((scope) =>
+    `<label><input type="checkbox" name="scope" value="${htmlEscape(scope)}" checked> ${htmlEscape(scope)}</label>`,
+  ).join("<br>");
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Authorize ${name}</title><main><h1>Allow ${name} to access Evolution Go?</h1><p>${origin} Access will be sent to <strong>${htmlEscape(details.redirectHost)}</strong>.</p>${details.redirectIsLoopback ? "<p><strong>This sends access to an app on your computer.</strong> Continue only if you just started signing in from it.</p>" : ""}<form method="post" action="/authorize"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopes}<p><button name="decision" value="approve">Allow</button> <button name="decision" value="deny">Deny</button></p></form></main></html>`;
+}
+
+async function equalSecret(left: string, right: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(left)),
+    crypto.subtle.digest("SHA-256", enc.encode(right)),
+  ]);
+  const aa = new Uint8Array(a);
+  const bb = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < aa.length; i++) diff |= aa[i] ^ bb[i];
+  return diff === 0;
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function signSession(expiry: number, secret: string): Promise<string> {
+  const payload = String(expiry);
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
+  return `${payload}.${bytesToBase64Url(signature)}`;
+}
+
+async function validSession(request: Request, env: Env): Promise<boolean> {
+  const cookie = request.headers.get("Cookie")?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${AUTH_COOKIE}=`));
+  const value = cookie?.slice(AUTH_COOKIE.length + 1) ?? "";
+  const [expiryText, signature, extra] = value.split(".");
+  if (!expiryText || !signature || extra !== undefined) return false;
+  const expiry = Number(expiryText);
+  if (!Number.isSafeInteger(expiry) || expiry <= Math.floor(Date.now() / 1000) || expiry > Math.floor(Date.now() / 1000) + AUTH_SESSION_SECONDS + 30) return false;
+  const expected = await signSession(expiry, env.MCP_SESSION_SECRET ?? "");
+  return await equalSecret(value, expected);
+}
+
+function sameOrigin(request: Request, env: Env): boolean {
+  return request.headers.get("Origin") === MCP_ISSUER;
+}
+
+async function handleLogin(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST" || !sameOrigin(request, env)) return new Response("Forbidden", { status: 403 });
+  const form = await request.formData();
+  const password = String(form.get("password") ?? "");
+  const returnTo = String(form.get("return_to") ?? "");
+  let returnUrl: URL;
+  try { returnUrl = new URL(returnTo, MCP_ISSUER); } catch { return new Response("Invalid sign-in request", { status: 400 }); }
+  if (returnUrl.origin !== MCP_ISSUER || returnUrl.pathname !== "/authorize" || !returnUrl.search) return new Response("Invalid sign-in request", { status: 400 });
+  if (!env.MCP_LOGIN_PASSWORD || !env.MCP_SESSION_SECRET || password.length < 32 || !(await equalSecret(password, env.MCP_LOGIN_PASSWORD))) {
+    return safeHtml("<!doctype html><meta charset=utf-8><title>Sign-in failed</title><h1>Sign-in failed</h1><p>Check the password and try again.</p><a href=\"/\">Return</a>", new Headers({ "Cache-Control": "no-store" }));
+  }
+  const expiry = Math.floor(Date.now() / 1000) + AUTH_SESSION_SECONDS;
+  const value = await signSession(expiry, env.MCP_SESSION_SECRET);
+  const headers = new Headers({ "Location": returnUrl.toString(), "Set-Cookie": `${AUTH_COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${AUTH_SESSION_SECONDS}` });
+  return new Response(null, { status: 303, headers });
+}
+
+async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  const oauth = authorizationServer.getOAuthApi(env);
+  if (request.method === "POST") {
+    if (!sameOrigin(request, env) || !(await validSession(request, env))) return new Response("Sign in again to authorize this connection.", { status: 401 });
+    const form = await request.formData();
+    const handle = String(form.get("handle") ?? "");
+    if (form.get("decision") === "deny") {
+      try {
+        const denied = await oauth.denyConsent(request, handle);
+        return new Response(null, { status: 302, headers: denied.headers });
+      } catch {
+        return new Response("This authorization request expired. Start again from ChatGPT.", { status: 400 });
+      }
+    }
+    try {
+      const approved = await oauth.approveConsent(request, handle, { scope: form.getAll("scope").map(String) });
+      const { redirectTo } = await oauth.completeAuthorization({
+        request: approved.request,
+        userId: "owner",
+        metadata: { name: "Evolution Go owner" },
+        scope: approved.request.scope,
+        props: { userId: "owner", scopes: approved.request.scope },
+      });
+      approved.headers.set("Location", redirectTo);
+      return new Response(null, { status: 302, headers: approved.headers });
+    } catch {
+      return new Response("This authorization request expired or is invalid. Start again from ChatGPT.", { status: 400 });
+    }
+  }
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
+  try {
+    const authRequest = await oauth.parseAuthRequest(request);
+    if (!(await validSession(request, env))) return loginPage(new URL(request.url).pathname + new URL(request.url).search);
+    const details = await oauth.describeConsent(authRequest);
+    const consent = await oauth.beginConsent(authRequest);
+    return safeHtml(consentPage(details, consent.handle), consent.headers);
+  } catch (error) {
+    if (error instanceof AuthorizationError) {
+      if (error.redirectTo) return Response.redirect(error.redirectTo, 302);
+      return new Response(error.description, { status: 400 });
+    }
+    return new Response("Could not start authorization. Please try again.", { status: 500 });
+  }
 }
 
 type JsonObject = Record<string, unknown>;
@@ -45,24 +202,6 @@ function textResult(value: unknown) {
 
 function safeError(message: string) {
   return textResult({ error: message });
-}
-
-async function authorized(request: Request, env: Env): Promise<boolean> {
-  const supplied = request.headers.get("authorization") ?? "";
-  const expected = `Bearer ${env.MCP_ACCESS_TOKEN ?? ""}`;
-  if (!env.MCP_ACCESS_TOKEN || supplied.length !== expected.length) return false;
-  // Compare the provided and expected values through a keyed digest to avoid
-  // a content-dependent comparison. Length is checked before hashing.
-  const digest = async (value: string) => crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  const [a, b] = await Promise.all([digest(supplied), digest(expected)]);
-  return equalSecretBytes(new Uint8Array(a), new Uint8Array(b));
-}
-
-function equalSecretBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
 }
 
 async function getSpec(): Promise<ApiSpec> {
@@ -150,8 +289,10 @@ async function callEvolution(
   query: JsonObject,
   body: unknown,
   confirmWrite: boolean,
+  writeScope: boolean,
 ): Promise<unknown> {
   const write = !["GET", "HEAD"].includes(operation.method);
+  if (write && !writeScope) throw new Error("This OAuth connection does not have mcp:write permission. Reconnect and approve the write scope first.");
   if (write && confirmWrite !== true) {
     throw new Error("This operation changes data. Call again only after the user has explicitly approved this exact action, with confirm_write=true.");
   }
@@ -211,6 +352,8 @@ async function readSavedMessages(env: Env, args: { instance?: string; since?: st
 
 function createServer(env: Env) {
   const server = new McpServer({ name: "Evolution Go WhatsApp", version: "1.0.0" });
+  const auth = getMcpAuthContext()?.props as OAuthProps | undefined;
+  const writeScope = auth?.scopes?.includes("mcp:write") === true;
 
   server.registerTool("evolution_api_catalog", {
     description: "Read Evolution Go's live API catalogue. Use this first to discover the deployed operation IDs, HTTP methods, paths, input parameters, and request body schema before calling an operation. This tool does not change anything.",
@@ -239,7 +382,7 @@ function createServer(env: Env) {
     try {
       const operation = listOperations(await getSpec()).find((op) => op.operationId === operation_id);
       if (!operation) return safeError("Unknown operationId. Call evolution_api_catalog and choose an exact listed operation.");
-      return textResult(await callEvolution(env, operation, path_params, query, body, confirm_write));
+      return textResult(await callEvolution(env, operation, path_params, query, body, confirm_write, writeScope));
     } catch (error) {
       return safeError(error instanceof Error ? error.message : "Evolution Go request failed.");
     }
@@ -257,10 +400,26 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
     if (url.pathname === "/" && request.method === "GET") {
-      return Response.json({ name: "Evolution Go WhatsApp MCP", endpoint: "/mcp", authenticated: true });
+      return Response.json({ name: "Evolution Go WhatsApp MCP", endpoint: "/mcp", authentication: "OAuth 2.1" });
     }
-    if (url.pathname !== "/mcp") return new Response("Not found", { status: 404 });
-    if (!(await authorized(request, env))) return new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
-    return createMcpHandler(() => createServer(env))(request, env, ctx);
+    if (url.pathname === "/login") return handleLogin(request, env);
+    if (url.pathname === "/authorize") return handleAuthorize(request, env);
+    if (url.pathname === "/mcp") return resourceServer.fetch(request, env, ctx);
+    return authorizationServer.fetch(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;
+
+const resourceServer = new OAuthResourceServer<Env, OAuthProps>({
+  resourceMetadata: {
+    resource: MCP_RESOURCE,
+    authorization_servers: [MCP_ISSUER],
+  },
+  requiredScopes: ["mcp:read", "mcp:write"],
+  validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
+  handler: {
+    fetch(request, env, ctx) {
+      if (!ctx.auth.scope.includes("mcp:read")) return insufficientScope(ctx.auth, ["mcp:read"]);
+      return createMcpHandler(() => createServer(env))(request, env, ctx);
+    },
+  },
+});
