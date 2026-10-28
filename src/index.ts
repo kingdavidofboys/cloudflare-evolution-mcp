@@ -14,6 +14,26 @@ const OPENAPI_URL = `${EVOLUTION_BASE}/swagger/doc.json`;
 const MAX_SPEC_BYTES = 4 * 1024 * 1024;
 const MAX_RESPONSE_CHARS = 24_000;
 const MAX_MESSAGE_LIMIT = 100;
+const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
+const LOGIN_RATE_WINDOW_SECONDS = 900;
+const MAX_LOGIN_FAILURES = 5;
+const READ_ONLY_POST_PATHS = new Set([
+  "/group/info",
+  "/group/invitelink",
+  "/message/downloadmedia",
+  "/message/status",
+  "/newsletter/info",
+  "/newsletter/link",
+  "/newsletter/messages",
+  "/user/avatar",
+  "/user/check",
+  "/user/info",
+]);
+const MUTATING_GET_PATHS = new Set([
+  "/instance/qr",
+  "/license/activate",
+  "/license/register",
+]);
 
 interface Env {
   MCP_LOGIN_PASSWORD: string;
@@ -54,9 +74,19 @@ function safeHtml(body: string, headers = new Headers()): Response {
   return new Response(body, { headers });
 }
 
-function loginPage(returnTo: string): Response {
+function loginPage(returnTo: string, error = ""): Response {
   const safeReturnTo = htmlEscape(returnTo);
-  return safeHtml(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Sign in to Evolution Go MCP</title><main><h1>Sign in</h1><p>Enter your MCP login password to continue.</p><form method="post" action="/login"><input type="hidden" name="return_to" value="${safeReturnTo}"><label>Password <input type="password" name="password" required autocomplete="current-password"></label><p><button type="submit">Continue</button></p></form></main></html>`);
+  const alert = error ? `<p class="alert" role="alert">${htmlEscape(error)}</p>` : "";
+  return safeHtml(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="color-scheme" content="dark light"><title>Sign in · Evolution Go</title><style>
+    :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#edf5f1;background:#0c1110;font-synthesis:none}
+    *{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at top,#17352b 0,#0c1110 55%)}
+    .card{width:min(100%,440px);padding:34px;border:1px solid #29443a;border-radius:22px;background:#111917;box-shadow:0 24px 80px #0008}
+    .brand{display:flex;align-items:center;gap:12px;color:#74f0b3;font-size:14px;font-weight:700;letter-spacing:.04em}.mark{width:38px;height:38px;display:grid;place-items:center;border-radius:12px;background:#143b2b;font-size:20px}
+    h1{margin:28px 0 8px;font-size:27px;letter-spacing:-.03em}p{color:#afc0b8;line-height:1.55}.intro{margin:0 0 24px}.alert{padding:12px 14px;border:1px solid #874747;border-radius:12px;background:#381c1c;color:#ffd1d1}
+    label{display:block;margin:0 0 8px;color:#dce8e1;font-size:14px;font-weight:600}input{width:100%;padding:13px 14px;border:1px solid #3b5147;border-radius:11px;background:#0b100e;color:#fff;font:inherit;outline:none}input:focus{border-color:#69dca4;box-shadow:0 0 0 3px #69dca433}
+    button{width:100%;margin-top:16px;padding:13px 16px;border:0;border-radius:11px;background:#31c77b;color:#082115;font:inherit;font-weight:750;cursor:pointer}button:hover{background:#65dfa0}button:focus-visible{outline:3px solid #fff;outline-offset:3px}
+    .note{margin:20px 0 0;padding-top:17px;border-top:1px solid #26362f;font-size:13px}.lock{color:#74f0b3}.foot{margin:18px 0 0;text-align:center;color:#71877b;font-size:12px}
+    </style></head><body><main class="card"><div class="brand"><span class="mark" aria-hidden="true">↗</span><span>EVOLUTION GO · PRIVATE MCP</span></div><h1>Sign in to connect</h1><p class="intro">Use your MCP password to continue connecting ChatGPT to your Evolution Go account.</p>${alert}<form method="post" action="/login"><input type="hidden" name="return_to" value="${safeReturnTo}"><label for="password">MCP password</label><input id="password" type="password" name="password" required minlength="32" autocomplete="current-password" autofocus><button type="submit">Continue securely</button></form><p class="note"><span class="lock">🔒 Private sign-in.</span> This is the separate password you created for this MCP, not your Evolution Go, Render, Supabase, or Google password. You’ll review the requested access before it is granted.</p><p class="foot">Your password is checked by your Cloudflare Worker and is not sent to ChatGPT.</p></main></body></html>`);
 }
 
 function consentPage(details: ConsentDescription, handle: string): string {
@@ -64,10 +94,27 @@ function consentPage(details: ConsentDescription, handle: string): string {
   const origin = details.clientDomain
     ? `Published by <strong>${htmlEscape(details.clientDomain)}</strong>.`
     : "This client registered itself; its name is not verified.";
-  const scopes = details.scope.map((scope) =>
-    `<label><input type="checkbox" name="scope" value="${htmlEscape(scope)}" checked> ${htmlEscape(scope)}</label>`,
-  ).join("<br>");
-  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Authorize ${name}</title><main><h1>Allow ${name} to access Evolution Go?</h1><p>${origin} Access will be sent to <strong>${htmlEscape(details.redirectHost)}</strong>.</p>${details.redirectIsLoopback ? "<p><strong>This sends access to an app on your computer.</strong> Continue only if you just started signing in from it.</p>" : ""}<form method="post" action="/authorize"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopes}<p><button name="decision" value="approve">Allow</button> <button name="decision" value="deny">Deny</button></p></form></main></html>`;
+  const descriptions: Record<string, string> = {
+    "mcp:read": "Read data exposed by your Evolution Go API, such as chats, contacts, groups, and instance status.",
+    "mcp:write": "Send messages and make changes supported by the API, including group and instance management. Each change still needs your explicit approval in chat.",
+    "offline_access": "Keep the connection working between ChatGPT sessions by refreshing its access token.",
+  };
+  const requiredScopes = ["mcp:read", "mcp:write"];
+  const missingRequiredScopes = requiredScopes.filter((scope) => !details.scope.includes(scope));
+  const canApprove = missingRequiredScopes.length === 0;
+  const scopes = details.scope.map((scope) => {
+    const required = requiredScopes.includes(scope);
+    const accessControl = required
+      ? `<input type="hidden" name="scope" value="${htmlEscape(scope)}"><span class="badge">Required</span>`
+      : `<input type="checkbox" name="scope" value="${htmlEscape(scope)}" checked>`;
+    return `<label class="permission">${accessControl}<span><strong>${htmlEscape(scope)}</strong><small>${htmlEscape(descriptions[scope] ?? "Allow the requested capability described by this scope.")}</small></span></label>`;
+  }).join("<br>");
+  const incomplete = canApprove ? "" : `<p class="warning">This app requested only part of the access needed. To use Evolution Go’s read and write tools, cancel and reconnect with both <strong>mcp:read</strong> and <strong>mcp:write</strong>. Missing: ${missingRequiredScopes.map(htmlEscape).join(", ")}.</p>`;
+  const approvalButton = canApprove ? `<button class="allow" name="decision" value="approve">Allow selected access</button>` : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="color-scheme" content="dark light"><title>Review access · Evolution Go</title><style>
+    :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#edf5f1;background:#0c1110}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at top,#17352b 0,#0c1110 55%)}
+    .card{width:min(100%,620px);padding:32px;border:1px solid #29443a;border-radius:22px;background:#111917;box-shadow:0 24px 80px #0008}.brand{color:#74f0b3;font-size:13px;font-weight:750;letter-spacing:.05em}h1{margin:24px 0 10px;font-size:26px;letter-spacing:-.03em}p{color:#afc0b8;line-height:1.55}.client{margin:0 0 22px;padding:14px 16px;border:1px solid #2b3d34;border-radius:12px;background:#0b100e}.client strong{color:#f2faf5}.permission{display:flex;align-items:flex-start;gap:12px;margin:10px 0;padding:14px;border:1px solid #2b3d34;border-radius:12px;background:#0d1411}.permission input{width:18px;height:18px;margin:2px 0 0;accent-color:#31c77b}.permission strong{display:block;color:#e8f4ec}.permission small{display:block;margin-top:5px;color:#aebfb5;font-size:13px;line-height:1.45}.badge{margin-left:auto;padding:4px 8px;border-radius:999px;background:#18392a;color:#91e9b7;font-size:11px;font-weight:700}.warning{padding:13px 15px;border-left:3px solid #e2a43a;background:#2a2419;color:#e9d7b5;font-size:13px}.actions{display:flex;gap:12px;margin-top:22px}.actions button{flex:1;min-height:46px;border:0;border-radius:11px;font:inherit;font-weight:750;cursor:pointer}.allow{background:#31c77b;color:#082115}.deny{background:#26342d;color:#e9f1ec}.actions button:focus-visible{outline:3px solid #fff;outline-offset:3px}.foot{font-size:12px;color:#71877b}
+    </style></head><body><main class="card"><div class="brand">EVOLUTION GO · PERMISSION REVIEW</div><h1>Review this connection</h1><p>Choose what <strong>${name}</strong> can do with your Evolution Go account.</p><div class="client">${origin}<br>Access will be sent to <strong>${htmlEscape(details.redirectHost)}</strong>.</div>${details.redirectIsLoopback ? `<p class="warning">This sends access to an app on your computer. Continue only if you just started signing in from it.</p>` : ""}${incomplete}<form method="post" action="/authorize"><input type="hidden" name="handle" value="${htmlEscape(handle)}">${scopes}<div class="actions">${approvalButton}<button class="deny" name="decision" value="deny">Cancel</button></div></form><form method="post" action="/logout"><button class="deny" type="submit">Sign out from this browser</button></form><p class="foot">The password is never shared with this client. State-changing calls still require your specific approval in chat.</p></main></body></html>`;
 }
 
 async function equalSecret(left: string, right: string): Promise<boolean> {
@@ -87,6 +134,12 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function loginRateKey(request: Request): Promise<string> {
+  const address = request.headers.get("CF-Connecting-IP") ?? "unknown-client";
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(address)));
+  return `evolution-mcp:login-rate:${bytesToBase64Url(digest)}`;
 }
 
 async function signSession(expiry: number, secret: string): Promise<string> {
@@ -119,9 +172,19 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
   let returnUrl: URL;
   try { returnUrl = new URL(returnTo, MCP_ISSUER); } catch { return new Response("Invalid sign-in request", { status: 400 }); }
   if (returnUrl.origin !== MCP_ISSUER || returnUrl.pathname !== "/authorize" || !returnUrl.search) return new Response("Invalid sign-in request", { status: 400 });
-  if (!env.MCP_LOGIN_PASSWORD || !env.MCP_SESSION_SECRET || password.length < 32 || !(await equalSecret(password, env.MCP_LOGIN_PASSWORD))) {
-    return safeHtml("<!doctype html><meta charset=utf-8><title>Sign-in failed</title><h1>Sign-in failed</h1><p>Check the password and try again.</p><a href=\"/\">Return</a>", new Headers({ "Cache-Control": "no-store" }));
+  const rateKey = await loginRateKey(request);
+  const attempts = await env.OAUTH_KV.get<{ count: number }>(rateKey, "json");
+  if ((attempts?.count ?? 0) >= MAX_LOGIN_FAILURES) {
+    const response = loginPage(returnTo, "Too many attempts. Wait 15 minutes, then try again.");
+    const headers = new Headers(response.headers);
+    headers.set("Retry-After", String(LOGIN_RATE_WINDOW_SECONDS));
+    return new Response(response.body, { status: 429, headers });
   }
+  if (!env.MCP_LOGIN_PASSWORD || !env.MCP_SESSION_SECRET || password.length < 32 || !(await equalSecret(password, env.MCP_LOGIN_PASSWORD))) {
+    await env.OAUTH_KV.put(rateKey, JSON.stringify({ count: (attempts?.count ?? 0) + 1 }), { expirationTtl: LOGIN_RATE_WINDOW_SECONDS });
+    return loginPage(returnTo, "That password didn’t match, or OAuth sign-in is not fully configured yet. Check the MCP secrets and try again.");
+  }
+  await env.OAUTH_KV.delete(rateKey);
   const expiry = Math.floor(Date.now() / 1000) + AUTH_SESSION_SECONDS;
   const value = await signSession(expiry, env.MCP_SESSION_SECRET);
   const headers = new Headers({ "Location": returnUrl.toString(), "Set-Cookie": `${AUTH_COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${AUTH_SESSION_SECONDS}` });
@@ -171,6 +234,17 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
     }
     return new Response("Could not start authorization. Please try again.", { status: 500 });
   }
+}
+
+async function handleLogout(request: Request): Promise<Response> {
+  if (request.method !== "POST" || request.headers.get("Origin") !== MCP_ISSUER) return new Response("Forbidden", { status: 403 });
+  return new Response("You are signed out. You can close this page.", {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Set-Cookie": `${AUTH_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`,
+    },
+  });
 }
 
 type JsonObject = Record<string, unknown>;
@@ -266,6 +340,12 @@ function isAdminOperation(path: string): boolean {
     path.startsWith("/license/");
 }
 
+function requiresWriteApproval(operation: ApiOperation): boolean {
+  if (READ_ONLY_POST_PATHS.has(operation.path)) return false;
+  if (MUTATING_GET_PATHS.has(operation.path)) return true;
+  return !["GET", "HEAD"].includes(operation.method);
+}
+
 function fillPath(path: string, pathParams: JsonObject): string {
   return path.replace(/\{([^}]+)\}/g, (_match, name: string) => {
     const value = pathParams[name];
@@ -291,7 +371,7 @@ async function callEvolution(
   confirmWrite: boolean,
   writeScope: boolean,
 ): Promise<unknown> {
-  const write = !["GET", "HEAD"].includes(operation.method);
+  const write = requiresWriteApproval(operation);
   if (write && !writeScope) throw new Error("This OAuth connection does not have mcp:write permission. Reconnect and approve the write scope first.");
   if (write && confirmWrite !== true) {
     throw new Error("This operation changes data. Call again only after the user has explicitly approved this exact action, with confirm_write=true.");
@@ -318,7 +398,7 @@ async function callEvolution(
   if (body !== undefined && body !== null && !["GET", "HEAD"].includes(operation.method)) {
     headers.set("Content-Type", "application/json");
     requestBody = JSON.stringify(body);
-    if (new TextEncoder().encode(requestBody).byteLength > 256 * 1024) throw new Error("Request body is too large (maximum 256 KB).");
+    if (new TextEncoder().encode(requestBody).byteLength > MAX_REQUEST_BODY_BYTES) throw new Error("Request body is too large (maximum 20 MB). Use a smaller media file or a supported media URL.");
   }
   const response = await fetch(target, { method: operation.method, headers, body: requestBody });
   const raw = await response.text();
@@ -355,6 +435,26 @@ function createServer(env: Env) {
   const auth = getMcpAuthContext()?.props as OAuthProps | undefined;
   const writeScope = auth?.scopes?.includes("mcp:write") === true;
 
+  server.registerTool("evolution_connection_status", {
+    description: "Check whether this Worker can reach the live Evolution Go API and list the documented feature groups. This is read-only and never sends a WhatsApp message or changes account data.",
+    inputSchema: z.object({}),
+  }, async () => {
+    try {
+      const spec = await getSpec();
+      const operations = listOperations(spec);
+      const categories = [...new Set(operations.flatMap((op) => op.tags ?? []))].sort();
+      const apiKey = env.EVOLUTION_INSTANCE_TOKEN;
+      if (!apiKey) return textResult({ ready: false, problem: "The Evolution instance API token is not configured as a Cloudflare Secret.", documented_operations: operations.length, categories, write_access: writeScope });
+      const response = await fetch(new URL("/instance/status", EVOLUTION_BASE), { headers: { Accept: "application/json", apikey: apiKey } });
+      const raw = await response.text();
+      let result: unknown = raw;
+      try { result = raw ? JSON.parse(raw) : null; } catch { /* preserve text response */ }
+      return textResult({ ready: response.ok, evolution_api: { status: response.status, result: truncate(result) }, documented_operations: operations.length, categories, write_access: writeScope, global_admin_access_configured: Boolean(env.EVOLUTION_GLOBAL_API_KEY), saved_message_reader_configured: Boolean(env.WHATSAPP_READ_URL && env.WHATSAPP_READ_SECRET) });
+    } catch (error) {
+      return safeError(error instanceof Error ? error.message : "Could not check the Evolution Go connection.");
+    }
+  });
+
   server.registerTool("evolution_api_catalog", {
     description: "Read Evolution Go's live API catalogue. Use this first to discover the deployed operation IDs, HTTP methods, paths, input parameters, and request body schema before calling an operation. This tool does not change anything.",
     inputSchema: z.object({ filter: z.string().optional().describe("Optional case-insensitive text filter over operation, tag, path, or summary."), include_schemas: z.boolean().default(false).describe("Include parameter and request body schema details when true.") }),
@@ -363,20 +463,22 @@ function createServer(env: Env) {
       const operations = listOperations(await getSpec());
       const normalized = (filter ?? "").toLowerCase();
       const matches = operations.filter((op) => !normalized || `${op.operationId} ${op.path} ${op.summary ?? ""} ${(op.tags ?? []).join(" ")}`.toLowerCase().includes(normalized));
-      return textResult(matches.map(({ responses: _responses, ...op }) => include_schemas ? op : ({ operationId: op.operationId, method: op.method, path: op.path, tags: op.tags, summary: op.summary })));
+      return textResult(matches.map(({ responses: _responses, ...op }) => include_schemas
+        ? { ...op, requires_write_approval: requiresWriteApproval(op) }
+        : { operationId: op.operationId, method: op.method, path: op.path, tags: op.tags, summary: op.summary, requires_write_approval: requiresWriteApproval(op) }));
     } catch (error) {
       return safeError(error instanceof Error ? error.message : "Could not load Evolution Go API catalogue.");
     }
   });
 
   server.registerTool("call_evolution_api", {
-    description: "Call one documented Evolution Go API operation by the exact operationId from evolution_api_catalog. Only paths in Evolution Go's own live OpenAPI spec are allowed; the host is fixed to the user's Evolution Go server. Use the instance token for normal operations and the global key for admin operations. For every non-GET operation, require the user to clearly approve that specific action before calling, and set confirm_write=true. Do not use for unsolicited/bulk messaging, adding people to groups without their consent, or circumventing WhatsApp limits. Send one operation per call.",
+    description: "Call any documented Evolution Go API operation by the exact operationId from evolution_api_catalog. This covers sending messages, chats, contacts, groups, communities, instances, labels, newsletters, polls, and other live Swagger operations. The host is fixed to the user's Evolution Go server. Use only when the user requests the specific action. Before a send or state-changing operation (including group or instance changes, license changes, deletes, reactions, read receipts, and presence updates), describe the exact action and get the user's approval, then set confirm_write=true. Read-only API calls, including POST routes documented as Get/Download, do not need write approval. Do not send unsolicited/bulk messages, add people to groups without their consent, or bypass WhatsApp limits. Make one API call at a time.",
     inputSchema: z.object({
       operation_id: z.string().min(1),
       path_params: z.record(z.string(), z.unknown()).default({}),
       query: z.record(z.string(), z.unknown()).default({}),
       body: z.unknown().optional(),
-      confirm_write: z.boolean().default(false).describe("Must be true only after the user explicitly approved this exact write action."),
+      confirm_write: z.boolean().default(false).describe("Set true only after the user explicitly approved the exact state-changing action; leave false for reads."),
     }),
   }, async ({ operation_id, path_params, query, body, confirm_write }) => {
     try {
@@ -399,11 +501,19 @@ function createServer(env: Env) {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
+    if (url.pathname === "/healthz" && request.method === "GET") {
+      let apiAvailable = false;
+      try { await getSpec(); apiAvailable = true; } catch { /* readiness is reported below */ }
+      const ready = Boolean(env.OAUTH_KV && env.MCP_LOGIN_PASSWORD && env.MCP_SESSION_SECRET &&
+        env.EVOLUTION_INSTANCE_TOKEN && env.EVOLUTION_GLOBAL_API_KEY && apiAvailable);
+      return Response.json({ status: ready ? "ready" : "needs_configuration", api_catalog_available: apiAvailable }, { status: ready ? 200 : 503, headers: { "Cache-Control": "no-store" } });
+    }
     if (url.pathname === "/" && request.method === "GET") {
       return Response.json({ name: "Evolution Go WhatsApp MCP", endpoint: "/mcp", authentication: "OAuth 2.1" });
     }
     if (url.pathname === "/login") return handleLogin(request, env);
     if (url.pathname === "/authorize") return handleAuthorize(request, env);
+    if (url.pathname === "/logout") return handleLogout(request);
     if (url.pathname === "/mcp") return resourceServer.fetch(request, env, ctx);
     return authorizationServer.fetch(request, env, ctx);
   },
@@ -414,9 +524,9 @@ const resourceServer = new OAuthResourceServer<Env, OAuthProps>({
     resource: MCP_RESOURCE,
     authorization_servers: [MCP_ISSUER],
   },
-  // All connected clients need read access to use the MCP. Write access is
-  // checked separately by callEvolution for each non-GET operation.
-  requiredScopes: ["mcp:read"],
+  // Require full read/write authorization at connection time. Individual
+  // state-changing API operations also require explicit per-action approval.
+  requiredScopes: ["mcp:read", "mcp:write"],
   validateToken: (env) => (resource, token) => authorizationServer.validateToken(resource, token, env),
   handler: {
     fetch(request, env, ctx) {
