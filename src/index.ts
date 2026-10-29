@@ -400,7 +400,20 @@ async function callEvolution(
     requestBody = JSON.stringify(body);
     if (new TextEncoder().encode(requestBody).byteLength > MAX_REQUEST_BODY_BYTES) throw new Error("Request body is too large (maximum 20 MB). Use a smaller media file or a supported media URL.");
   }
-  const response = await fetch(target, { method: operation.method, headers, body: requestBody });
+  let response: Response;
+  try {
+    response = await fetch(target, {
+      method: operation.method,
+      headers,
+      body: requestBody,
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new Error(`Evolution Go API request timed out after 30 seconds (${operation.method} ${operation.path}). Check the Evolution Go service logs and this API route.`);
+    }
+    throw error;
+  }
   const raw = await response.text();
   let responseBody: unknown = raw;
   try { responseBody = raw ? JSON.parse(raw) : null; } catch { /* keep plain-text response */ }
