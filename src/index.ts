@@ -435,21 +435,39 @@ async function sendGroupMessageByName(env: Env, args: { group_name: string; text
   const operations = listOperations(await getSpec());
   const listOperation = operations.find((op) => op.operationId === "get__group_list");
   const sendOperation = operations.find((op) => op.operationId === "post__send_text");
-  if (!listOperation || !sendOperation) return safeError("Evolution Go does not currently document both group listing and text sending.");
+  if (!sendOperation) return safeError("Evolution Go does not currently document text sending.");
 
-  const listed = object(await callEvolution(env, listOperation, {}, {}, undefined, false, writeScope, false));
-  if (listed.ok !== true) return safeError(`Could not look up groups (HTTP ${String(listed.status ?? "unknown")}).`);
-  const payload = object(listed.result);
-  const rows = Array.isArray(payload.data) ? payload.data : Array.isArray(payload.groups) ? payload.groups : [];
-  const normalize = (value: string) => value.normalize("NFC").trim().replace(/\\s+/g, " ").toLocaleLowerCase();
+  const normalize = (value: string) => value.normalize("NFC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
   const wanted = normalize(args.group_name);
-  const matches = rows.map((row) => {
-    const group = object(row);
-    const nameObject = object(group.GroupName);
-    const name = typeof nameObject.Name === "string" ? nameObject.Name : typeof group.name === "string" ? group.name : typeof group.subject === "string" ? group.subject : "";
-    const jid = typeof group.JID === "string" ? group.JID : typeof group.jid === "string" ? group.jid : "";
-    return { name, jid };
-  }).filter((group) => group.name && group.jid && normalize(group.name) === wanted);
+  let matches: Array<{ name: string; jid: string }> = [];
+
+  if (env.WHATSAPP_READ_URL && env.WHATSAPP_READ_SECRET) {
+    try {
+      const cached = object(await readCachedGroups(env));
+      const cachedRows = Array.isArray(cached.groups) ? cached.groups : [];
+      matches = cachedRows.map((row) => {
+        const group = object(row);
+        return { name: typeof group.group_name === "string" ? group.group_name : "", jid: typeof group.group_jid === "string" ? group.group_jid : "" };
+      }).filter((group) => group.name && group.jid && normalize(group.name) === wanted);
+    } catch {
+      // Try the live API as a fallback if the cache is temporarily unavailable.
+    }
+  }
+
+  // Prefer the private webhook cache, which avoids Evolution Go's slow full-list endpoint.
+  if (matches.length === 0 && listOperation) {
+    const listed = object(await callEvolution(env, listOperation, {}, {}, undefined, false, writeScope, false));
+    if (listed.ok !== true) return safeError(`Could not look up “${args.group_name}” in the saved group cache or Evolution Go (HTTP ${String(listed.status ?? "unknown")}).`);
+    const payload = object(listed.result);
+    const rows = Array.isArray(payload.data) ? payload.data : Array.isArray(payload.groups) ? payload.groups : [];
+    matches = rows.map((row) => {
+      const group = object(row);
+      const nameObject = object(group.GroupName);
+      const name = typeof nameObject.Name === "string" ? nameObject.Name : typeof group.name === "string" ? group.name : typeof group.subject === "string" ? group.subject : "";
+      const jid = typeof group.JID === "string" ? group.JID : typeof group.jid === "string" ? group.jid : "";
+      return { name, jid };
+    }).filter((group) => group.name && group.jid && normalize(group.name) === wanted);
+  }
 
   if (matches.length === 0) return safeError(`No group matched the exact name “${args.group_name}”. Check the name in WhatsApp or try again when Evolution Go’s group list is available.`);
   if (matches.length > 1) return safeError(`More than one group has the exact name “${args.group_name}”. Rename one or provide a group JID so I can avoid messaging the wrong group.`);
@@ -458,6 +476,31 @@ async function sendGroupMessageByName(env: Env, args: { group_name: string; text
   const sent = object(await callEvolution(env, sendOperation, {}, {}, { number: group.jid, text: args.text }, true, writeScope));
   if (sent.ok !== true) return safeError(`Evolution Go did not confirm sending to “${group.name}” (HTTP ${String(sent.status ?? "unknown")}).`);
   return textResult({ sent: true, group: group.name, result: sent.result });
+}
+
+async function readCachedGroups(env: Env) {
+  if (!env.WHATSAPP_READ_URL || !env.WHATSAPP_READ_SECRET) return { groups: [] };
+  const response = await fetch(env.WHATSAPP_READ_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-mcp-read-secret": env.WHATSAPP_READ_SECRET },
+    body: JSON.stringify({ mode: "groups", limit: 500 }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) throw new Error(`Group cache read failed with HTTP ${response.status}.`);
+  let result: unknown;
+  try { result = await response.json(); } catch { throw new Error("Group cache returned invalid JSON."); }
+  return object(result);
+}
+
+async function searchCachedGroups(env: Env, groupName: string) {
+  const cached = await readCachedGroups(env);
+  const rows = Array.isArray(cached.groups) ? cached.groups : [];
+  const normalize = (value: string) => value.normalize("NFC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+  const wanted = normalize(groupName);
+  return rows.map((row) => {
+    const group = object(row);
+    return { name: typeof group.group_name === "string" ? group.group_name : "", jid: typeof group.group_jid === "string" ? group.group_jid : "", updated_at: group.updated_at };
+  }).filter((group) => group.name && group.jid && normalize(group.name).includes(wanted));
 }
 
 async function readSavedMessages(env: Env, args: { instance?: string; since?: string; limit: number }) {
@@ -537,7 +580,7 @@ function createServer(env: Env) {
   });
 
   server.registerTool("send_group_message_by_name", {
-    description: "Send one text message to a WhatsApp group selected by its exact group name. Resolves the name against Evolution Go's current group list internally, requires one exact match, and refuses ambiguous or missing matches. Use only after the user explicitly approves this exact group and message, then set confirm_write=true.",
+    description: "Send one text message to a WhatsApp group selected by its exact group name. Resolves from the private webhook group cache first, with Evolution Go's group list as fallback. Requires one exact match and refuses ambiguous or missing matches. Use only after the user explicitly approves this exact group and message, then set confirm_write=true.",
     inputSchema: z.object({
       group_name: z.string().min(1).max(200),
       text: z.string().min(1).max(4000),
@@ -548,6 +591,18 @@ function createServer(env: Env) {
       return await sendGroupMessageByName(env, args, writeScope);
     } catch (error) {
       return safeError(error instanceof Error ? error.message : "Could not resolve or message the requested group.");
+    }
+  });
+
+  server.registerTool("search_whatsapp_groups", {
+    description: "Search group names and IDs recorded by Evolution Go's GROUP webhook events. This avoids asking the user to find or store group IDs. Groups appear after Evolution Go sends a GroupInfo or JoinedGroup event. Read-only.",
+    inputSchema: z.object({ query: z.string().min(1).max(200) }),
+  }, async ({ query }) => {
+    try {
+      const matches = await searchCachedGroups(env, query);
+      return textResult(matches.map(({ name, jid, updated_at }) => ({ name, jid, updated_at })));
+    } catch (error) {
+      return safeError(error instanceof Error ? error.message : "Could not search the saved group names.");
     }
   });
 
