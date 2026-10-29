@@ -370,6 +370,7 @@ async function callEvolution(
   body: unknown,
   confirmWrite: boolean,
   writeScope: boolean,
+  truncateResult = true,
 ): Promise<unknown> {
   const write = requiresWriteApproval(operation);
   if (write && !writeScope) throw new Error("This OAuth connection does not have mcp:write permission. Reconnect and approve the write scope first.");
@@ -423,8 +424,40 @@ async function callEvolution(
     path: operation.path,
     status: response.status,
     ok: response.ok,
-    result: truncate(responseBody),
+    result: truncateResult ? truncate(responseBody) : responseBody,
   };
+}
+
+async function sendGroupMessageByName(env: Env, args: { group_name: string; text: string; confirm_write: boolean }, writeScope: boolean) {
+  if (!writeScope) return safeError("This OAuth connection does not have mcp:write permission. Reconnect and approve the write scope first.");
+  if (args.confirm_write !== true) return safeError("Sending changes data. Call again only after the user explicitly approved sending this exact message to this exact group, with confirm_write=true.");
+
+  const operations = listOperations(await getSpec());
+  const listOperation = operations.find((op) => op.operationId === "get__group_list");
+  const sendOperation = operations.find((op) => op.operationId === "post__send_text");
+  if (!listOperation || !sendOperation) return safeError("Evolution Go does not currently document both group listing and text sending.");
+
+  const listed = object(await callEvolution(env, listOperation, {}, {}, undefined, false, writeScope, false));
+  if (listed.ok !== true) return safeError(`Could not look up groups (HTTP ${String(listed.status ?? "unknown")}).`);
+  const payload = object(listed.result);
+  const rows = Array.isArray(payload.data) ? payload.data : Array.isArray(payload.groups) ? payload.groups : [];
+  const normalize = (value: string) => value.normalize("NFC").trim().replace(/\\s+/g, " ").toLocaleLowerCase();
+  const wanted = normalize(args.group_name);
+  const matches = rows.map((row) => {
+    const group = object(row);
+    const nameObject = object(group.GroupName);
+    const name = typeof nameObject.Name === "string" ? nameObject.Name : typeof group.name === "string" ? group.name : typeof group.subject === "string" ? group.subject : "";
+    const jid = typeof group.JID === "string" ? group.JID : typeof group.jid === "string" ? group.jid : "";
+    return { name, jid };
+  }).filter((group) => group.name && group.jid && normalize(group.name) === wanted);
+
+  if (matches.length === 0) return safeError(`No group matched the exact name “${args.group_name}”. Check the name in WhatsApp or try again when Evolution Go’s group list is available.`);
+  if (matches.length > 1) return safeError(`More than one group has the exact name “${args.group_name}”. Rename one or provide a group JID so I can avoid messaging the wrong group.`);
+
+  const group = matches[0];
+  const sent = object(await callEvolution(env, sendOperation, {}, {}, { number: group.jid, text: args.text }, true, writeScope));
+  if (sent.ok !== true) return safeError(`Evolution Go did not confirm sending to “${group.name}” (HTTP ${String(sent.status ?? "unknown")}).`);
+  return textResult({ sent: true, group: group.name, result: sent.result });
 }
 
 async function readSavedMessages(env: Env, args: { instance?: string; since?: string; limit: number }) {
@@ -500,6 +533,21 @@ function createServer(env: Env) {
       return textResult(await callEvolution(env, operation, path_params, query, body, confirm_write, writeScope));
     } catch (error) {
       return safeError(error instanceof Error ? error.message : "Evolution Go request failed.");
+    }
+  });
+
+  server.registerTool("send_group_message_by_name", {
+    description: "Send one text message to a WhatsApp group selected by its exact group name. Resolves the name against Evolution Go's current group list internally, requires one exact match, and refuses ambiguous or missing matches. Use only after the user explicitly approves this exact group and message, then set confirm_write=true.",
+    inputSchema: z.object({
+      group_name: z.string().min(1).max(200),
+      text: z.string().min(1).max(4000),
+      confirm_write: z.boolean().default(false).describe("Set true only after the user explicitly approved sending this exact message to this exact group."),
+    }),
+  }, async (args) => {
+    try {
+      return await sendGroupMessageByName(env, args, writeScope);
+    } catch (error) {
+      return safeError(error instanceof Error ? error.message : "Could not resolve or message the requested group.");
     }
   });
 
